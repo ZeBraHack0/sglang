@@ -393,6 +393,19 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if model_runner.server_args.enable_return_hidden_states:
             self.capture_hidden_mode = CaptureHiddenMode.FULL
 
+        # NOTE: standalone SUFFIX intentionally captures in NULL hidden mode —
+        # it is ngram-v2-native (NgramVerifyInput, no capture_hidden_mode) and
+        # never consumes target hidden states, so it hits the cuda graph
+        # without allocating the unused FULL hidden-state buffers.
+        #
+        # HYBRID_SUFFIX_MTP, by contrast, needs FULL: its MTP step requires
+        # last-layer hidden states to keep the draft model's KV state in sync,
+        # and all three captured graphs (main K=num_draft_tokens, short_chain
+        # K=num_steps+1, baseline K=1) share this single capture_hidden_mode.
+        if model_runner.spec_algorithm.is_hybrid_suffix_mtp():
+            self.capture_hidden_mode = CaptureHiddenMode.FULL
+
+
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
         self.attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
