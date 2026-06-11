@@ -64,6 +64,11 @@ class NGRAMWorker:
 
         self.max_batch_size = target_worker.max_running_requests
         self.device = f"cuda:{gpu_id}" if gpu_id >= 0 else "cuda"
+        # Pipeline parallelism: drafts are CPU-built and identical on every PP
+        # rank, so non-last ranks forward-only and the last rank's accept is
+        # relayed back on the existing PP output ring (see
+        # forward_batch_generation and scheduler_pp_mixin).
+        self.pp_group = target_worker.pp_group
 
         self._init_preallocated_tensors()
 
@@ -215,6 +220,40 @@ class NGRAMWorker:
         # result processor calls it with batch_size as a keyword argument.
         if self.adaptive_controller is not None:
             self.adaptive_controller.on_verify_complete(num_correct_drafts_per_req)
+
+    def _pp_non_last_rank_result(
+        self, batch: ScheduleBatch, batch_result: GenerationBatchResult
+    ) -> GenerationBatchResult:
+        """Result for a non-last PP rank: hidden states ride the PP ring; the
+        last rank's accept is relayed back and applied by the scheduler at
+        delivery. The dummy next_draft_input only provides the staging tensors
+        ``_prepare_draft_tokens`` reads unconditionally — their contents are
+        never spliced because PP forces non-overlap scheduling."""
+        bs = len(batch.reqs)
+        if batch.forward_mode.is_target_verify():
+            if self.corpus_gc_on_departure:
+                # Keep corpus match-state GC aligned with the last rank.
+                cur_rids = {req.rid for req in batch.reqs}
+                departed_rids = self._prev_decode_rids - cur_rids
+                if departed_rids:
+                    self.ngram_corpus.erase_match_state(list(departed_rids))
+                self._prev_decode_rids = cur_rids
+            batch.forward_mode = ForwardMode.DECODE
+        next_draft_input = NgramVerifyInput(
+            draft_token_num=self.draft_token_num,
+            new_seq_lens=batch.seq_lens.clone(),
+            accept_tokens=torch.zeros(
+                bs * self.draft_token_num, dtype=torch.int32, device=self.device
+            ),
+            accept_lens=torch.ones(bs, dtype=torch.int32, device=self.device),
+        )
+        return GenerationBatchResult(
+            logits_output=None,
+            pp_hidden_states_proxy_tensors=batch_result.pp_hidden_states_proxy_tensors,
+            can_run_cuda_graph=batch_result.can_run_cuda_graph,
+            next_draft_input=next_draft_input,
+            speculative_num_draft_tokens=self.speculative_num_draft_tokens,
+        )
 
     def _prepare_draft_tokens(
         self, batch: ScheduleBatch
@@ -375,7 +414,7 @@ class NGRAMWorker:
         self.ngram_corpus.batch_put(batch_tokens)
 
     def forward_batch_generation(
-        self, batch: ScheduleBatch, on_publish=None
+        self, batch: ScheduleBatch, on_publish=None, pp_proxy_tensors=None
     ) -> GenerationBatchResult:
         fwd_stream = torch.get_device_module(self.device).current_stream()
         record_stream_for_v2_verify(batch, None, fwd_stream)
@@ -398,8 +437,17 @@ class NGRAMWorker:
                 ).cpu()
 
             batch_result = self.target_worker.forward_batch_generation(
-                batch, is_verify=True
+                batch, is_verify=True, pp_proxy_tensors=pp_proxy_tensors
             )
+
+            if not self.pp_group.is_last_rank:
+                # Non-last PP rank: no logits, so accept is computed on the
+                # last rank and relayed back on the PP output ring; the
+                # scheduler applies it (output_ids / seq_lens / kv counters)
+                # at delivery (see scheduler_pp_mixin). The draft and its KV
+                # slots are identical on every rank (CPU-built), so no
+                # cross-rank KV bookkeeping is needed here.
+                return self._pp_non_last_rank_result(batch, batch_result)
 
             logits_output, can_run_cuda_graph = (
                 batch_result.logits_output,
@@ -485,7 +533,13 @@ class NGRAMWorker:
             batch.forward_mode = ForwardMode.DECODE
 
         else:
-            batch_result = self.target_worker.forward_batch_generation(batch)
+            batch_result = self.target_worker.forward_batch_generation(
+                batch, pp_proxy_tensors=pp_proxy_tensors
+            )
+            if not self.pp_group.is_last_rank:
+                # Non-last PP rank extend/idle: hidden states ride the PP
+                # ring; the sampled token is relayed back by the scheduler.
+                return self._pp_non_last_rank_result(batch, batch_result)
             logits_output, predict, can_run_cuda_graph = (
                 batch_result.logits_output,
                 batch_result.next_token_ids,

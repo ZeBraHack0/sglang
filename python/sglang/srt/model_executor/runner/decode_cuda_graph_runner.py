@@ -1088,7 +1088,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
         else:
             assert isinstance(output, PPProxyTensors)
-            return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
+            # PP hidden states have bs*num_tokens_per_bs rows (one per
+            # token); slicing to bs truncates spec verify hidden to 1
+            # token/req and ships stale hidden for the rest.
+            num_token = self.bs * self.num_tokens_per_bs
+            return PPProxyTensors({k: v[:num_token] for k, v in output.tensors.items()})
 
     # -----------------------------------------------------------------
     # spec info
