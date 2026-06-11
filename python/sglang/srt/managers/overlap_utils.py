@@ -171,8 +171,11 @@ class FutureMap:
             )
 
     def _resolve_spec_extras(self, batch: ScheduleBatch) -> None:
-        if self.spec_algo.is_ngram():
+        if self.spec_algo.is_ngram() and not self.spec_algo.is_hybrid_suffix_mtp():
             # FIXME: remove once precomputed draft is supported.
+            # HYBRID_SUFFIX_MTP claims is_ngram() for dispatch but relays an
+            # EagleDraftInput (bonus_tokens / topk_p / topk_index) through the
+            # FutureMap like EAGLE, so it must NOT take the ngram early-out.
             return
         draft_input: EagleDraftInput = batch.spec_info
         if draft_input is None:
@@ -259,8 +262,9 @@ class FutureMap:
         future_indices: torch.Tensor,
         payload: Union[torch.Tensor, EagleDraftInput],
     ) -> None:
-        if self.spec_algo.is_ngram():
-            # FIXME: remove once precomputed draft is supported.
+        if self.spec_algo.is_ngram() and not self.spec_algo.is_hybrid_suffix_mtp():
+            # FIXME: remove once precomputed draft is supported (see
+            # _resolve_spec_extras for the HYBRID_SUFFIX_MTP exemption).
             return
         indices = future_indices
         if indices.shape[0] == 0:
