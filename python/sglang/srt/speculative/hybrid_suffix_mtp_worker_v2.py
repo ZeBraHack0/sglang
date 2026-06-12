@@ -130,13 +130,27 @@ class HybridSuffixMTPWorkerV2(EAGLEWorkerV2):
         # the attention backend).
         self._max_context_len = int(target_worker.model_runner.model_config.context_len)
 
+        # PD prefill instance: the MTP/EAGLE side stays fully alive (its draft
+        # extend produces the draft KV that PD transfers to the decode
+        # instance), but the SUFFIX side never speculates there — skip the
+        # arctic backend (no warmup load, no prompt-tree builds).
+        self._is_disagg_prefill = server_args.disaggregation_mode == "prefill"
+
         # SUFFIX-side state (mirrors SuffixWorkerV2).
-        self.suffix_draft_builder = SuffixV2DraftBuilder(
-            max_cached_requests=server_args.speculative_suffix_max_cached_requests,
-            max_tree_depth=server_args.speculative_suffix_max_tree_depth,
-            max_spec_factor=server_args.speculative_suffix_max_spec_factor,
-            min_token_prob=server_args.speculative_suffix_min_token_prob,
+        self.suffix_draft_builder = (
+            None
+            if self._is_disagg_prefill
+            else SuffixV2DraftBuilder(
+                max_cached_requests=server_args.speculative_suffix_max_cached_requests,
+                max_tree_depth=server_args.speculative_suffix_max_tree_depth,
+                max_spec_factor=server_args.speculative_suffix_max_spec_factor,
+                min_token_prob=server_args.speculative_suffix_min_token_prob,
+            )
         )
+
+        # PD decode instance: prebuilt requests pending suffix-tree prewarm
+        # (rid -> Req); see prewarm_disagg_requests / prewarm_step.
+        self._prewarm_pending: Dict[str, object] = {}
         self._req_tokens: Dict[str, List[int]] = {}
         self._pending_accepted: Dict[str, List[int]] = {}
         self._step_idx: int = 0
@@ -201,7 +215,9 @@ class HybridSuffixMTPWorkerV2(EAGLEWorkerV2):
             # Parent fires on_publish at the target-end fence.
             result = super().forward_batch_generation(mwb, on_publish)
             # Init arctic for any new rid (cheap; skipped for known rids).
-            self._initialize_new_reqs(mwb)
+            # PD prefill instance: no arctic backend (decode side rebuilds).
+            if not self._is_disagg_prefill:
+                self._initialize_new_reqs(mwb)
             # Tag last_seen for epoch GC.
             if mwb.reqs:
                 for req in mwb.reqs:
@@ -214,6 +230,9 @@ class HybridSuffixMTPWorkerV2(EAGLEWorkerV2):
                 self._rid_last_seen[req.rid] = self._step_idx
             if self._req_tokens:
                 self._gc_stale_rids()
+        # PD decode instance: cold-start / prewarm-sync prebuilt requests
+        # (no extend step ran here to initialize the suffix side).
+        self._reconcile_disagg_reqs(mwb)
 
         # Peek SUFFIX + MTP scores, let selector choose backend. The peek is
         # side-effecting on arctic (start_request / add_active_response) so
@@ -583,6 +602,53 @@ class HybridSuffixMTPWorkerV2(EAGLEWorkerV2):
     # ------------------------------------------------------------------
     # Helpers (shared with future SUFFIX/NONE paths)
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # PD disaggregation: decode-side suffix-tree prewarm + reconcile
+    # (mirrors SuffixWorkerV2; the MTP side needs nothing here — its draft KV
+    # arrives via the PD transfer and its first draft input via
+    # build_eagle_disagg_draft_input).
+    # ------------------------------------------------------------------
+    def prewarm_disagg_requests(self, reqs) -> None:
+        """Enqueue prebuilt requests for suffix-tree prewarm while their KV
+        transfer is still in flight. Idempotent per rid."""
+        for req in reqs:
+            rid = req.rid
+            if rid in self._req_tokens or rid in self._prewarm_pending:
+                continue
+            self._prewarm_pending[rid] = req
+
+    def prewarm_step(self, token_budget: int = 32768) -> None:
+        """Build at most token_budget prompt tokens of pending prewarm trees
+        (scheduler thread; arctic is not thread-safe)."""
+        spent = 0
+        while self._prewarm_pending and spent < token_budget:
+            rid, req = self._prewarm_pending.popitem()
+            if rid in self._req_tokens:
+                continue
+            prompt = list(req.origin_input_ids)
+            self.suffix_draft_builder.start_request(rid, prompt)
+            self._req_tokens[rid] = prompt
+            spent += len(prompt)
+
+    def _reconcile_disagg_reqs(self, mwb: ScheduleBatch) -> None:
+        """Cold-start prebuilt requests that outran the prewarm and append the
+        transferred output tail (the prefill-produced first token) for
+        prewarmed ones. No-op for colocated/ongoing requests."""
+        for req in mwb.reqs:
+            rid = req.rid
+            self._prewarm_pending.pop(rid, None)
+            tracked = self._req_tokens.get(rid)
+            if tracked is None:
+                tracked = list(req.origin_input_ids)
+                self.suffix_draft_builder.start_request(rid, tracked)
+                self._req_tokens[rid] = tracked
+            expected = len(req.origin_input_ids) + len(req.output_ids)
+            if len(tracked) < expected:
+                tracked.extend(
+                    req.output_ids[len(tracked) - len(req.origin_input_ids) :]
+                )
+                self.suffix_draft_builder.update_with_accepted(rid, tracked)
+
     def _initialize_new_reqs(self, mwb: ScheduleBatch) -> None:
         for req in mwb.reqs:
             rid = req.rid

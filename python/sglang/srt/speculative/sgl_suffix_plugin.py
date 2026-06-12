@@ -118,6 +118,27 @@ class _HybridLike(CustomSpecAlgo):
 
         return FutureMap(device, self, req_to_token_pool, needs_cpu_seq_lens)
 
+    def build_disagg_draft_input(
+        self,
+        batch,
+        server_args,
+        last_tokens_tensor,
+        future_map,
+    ):
+        # PD disaggregation: HYBRID's extend path is inherited from
+        # EAGLEWorkerV2 verbatim, so the decode instance's first draft input is
+        # exactly EAGLE's (real topk/hidden captured on the prefill instance
+        # and shipped via the metadata buffers). The SUFFIX side needs no
+        # shipped state -- its tree is rebuilt decode-side by the worker's
+        # prewarm hooks / lazy cold-start.
+        from sglang.srt.speculative.eagle_disaggregation import (
+            build_eagle_disagg_draft_input,
+        )
+
+        return build_eagle_disagg_draft_input(
+            batch, server_args, last_tokens_tensor, future_map
+        )
+
 
 def _hybrid_factory(server_args: "ServerArgs") -> Type:
     # HYBRID_SUFFIX_MTP is V2-only: it inherits EAGLEWorkerV2 and dispatches

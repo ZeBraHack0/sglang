@@ -51,7 +51,13 @@ def get_draft_kv_pool(
 ):
     """Return (draft_token_to_kv_pool, draft_model_config) for the current
     draft worker, or (None, None) when no draft KV pool is available."""
-    if draft_worker is None or spec_algorithm.is_ngram():
+    # HYBRID claims is_ngram() to reuse NGRAM dispatch, but its MTP path is a
+    # real EAGLE-style draft model whose KV pool MUST be registered (so PD can
+    # transfer the prompt-segment draft KV, which the decode instance cannot
+    # rebuild). Exempt it from the model-free early-out.
+    if draft_worker is None or (
+        spec_algorithm.is_ngram() and not spec_algorithm.is_hybrid_suffix_mtp()
+    ):
         return None, None
 
     # V2 (EAGLE family) nests the runner under `.draft_worker`; DFLASH /
