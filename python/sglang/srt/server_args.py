@@ -1587,6 +1587,17 @@ class ServerArgs:
         int,
         "Fail startup if the tokenized external ngram corpus exceeds this many tokens. Tune this based on your CPU memory budget.",
     ] = 10000000
+    speculative_ngram_linear: A[
+        bool,
+        (
+            "Emit a single linear draft chain instead of a BFS tree (forces "
+            "breadth 1 and no external SAM subtree). The accepted prefix then "
+            "occupies the canonical contiguous verify slots, so the post-verify "
+            "KV move is skipped -- required for NSA paged KV pools (e.g. "
+            "DeepSeek-V4 / GLM-5.2) that do not implement move_kv_cache, and a "
+            "prerequisite for ngram PD / PP / dp-attention support."
+        ),
+    ] = False
 
     # -------------------------------------------------------------------------
     # Expert parallelism
@@ -6655,8 +6666,18 @@ class ServerArgs:
 
         if self.pp_size > 1:
             assert (
-                self.disable_overlap_schedule and self.speculative_algorithm is None
-            ), "Pipeline parallelism is not compatible with overlap schedule, speculative decoding"
+                self.disable_overlap_schedule
+            ), "Pipeline parallelism is not compatible with overlap schedule"
+            # Linear-mode NGRAM is the one speculative path that supports PP: its
+            # draft is a fixed-width single chain, so the per-token PP proxy
+            # buffers and the spec-accept-length relay are well-defined.
+            assert self.speculative_algorithm is None or (
+                self.speculative_algorithm == "NGRAM" and self.speculative_ngram_linear
+            ), (
+                "Pipeline parallelism with speculative decoding is only supported "
+                "for linear-mode NGRAM (--speculative-algorithm NGRAM "
+                "--speculative-ngram-linear)."
+            )
 
         assert not (
             self.dp_size > 1 and self.nnodes != 1 and not self.enable_dp_attention
@@ -6687,6 +6708,24 @@ class ServerArgs:
             assert (
                 not self.enable_mixed_chunk
             ), "enable_mixed_chunk is required for speculative decoding"
+
+        # Linear-mode NGRAM: emit one chain so the accepted prefix is contiguous.
+        if self.speculative_ngram_linear:
+            assert self.speculative_algorithm == "NGRAM", (
+                "--speculative-ngram-linear only applies to "
+                "--speculative-algorithm NGRAM."
+            )
+            # An external SAM subtree merges at the root and would add a second
+            # chain (a tree), breaking the contiguous-accept invariant.
+            assert self.speculative_ngram_external_sam_budget == 0, (
+                "--speculative-ngram-linear requires "
+                "--speculative-ngram-external-sam-budget 0 (a single chain "
+                "cannot also host an external SAM subtree)."
+            )
+            # Force breadth 1 (the C++ side enforces single-chain regardless, but
+            # keep the reported config consistent).
+            self.speculative_ngram_min_bfs_breadth = 1
+            self.speculative_ngram_max_bfs_breadth = 1
 
         # Check chunked prefill
         # Skip validation if chunked prefill is disabled (i.e., size <= 0).

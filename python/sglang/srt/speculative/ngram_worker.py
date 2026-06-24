@@ -5,6 +5,7 @@ import numpy as np
 import torch
 from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.utils.logprob import compute_spec_v2_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -29,9 +30,6 @@ from sglang.srt.speculative.triton_ops.cache_locs import (
 from sglang.srt.utils.async_probe import maybe_detect_inf, maybe_detect_nan
 
 logger = logging.getLogger(__name__)
-
-
-USE_FULL_MASK = True
 
 
 class NGRAMWorker(BaseSpecWorker):
@@ -69,11 +67,27 @@ class NGRAMWorker(BaseSpecWorker):
         # req_to_token_pool / token_to_kv_pool_allocator are set in
         # alloc_memory_pool(), after the target pools are allocated.
         self.device = f"cuda:{gpu_id}" if gpu_id >= 0 else "cuda"
+        # Pipeline parallelism: drafts are CPU-built and identical on every PP
+        # rank, so non-last ranks forward-only and the last rank's accept is
+        # relayed back on the existing PP output ring (see
+        # forward_batch_generation and scheduler_pp_mixin).
+        self.pp_group = target_worker.pp_group
 
         self.adaptive_controller = None
         # rids of the last decode batch; used to erase corpus match state for
         # requests that left the batch (see forward_batch_generation).
         self._prev_decode_rids: set = set()
+
+        # QLEN_MASK is faster than FULL_MASK but needs the attention backend to
+        # read spec_info.custom_mask (e.g. DeepSeek-V4 / GLM-5.2 NSA). Default on
+        # to preserve the prior behaviour; NSA launches set the env to 0.
+        self.use_full_mask = envs.SGLANG_NGRAM_USE_FULL_MASK.get()
+
+        # Linear-chain mode: the C++ corpus emits a single chain, so the accepted
+        # prefix occupies the canonical contiguous verify slots and the
+        # post-verify move_kv_cache becomes an identity (skipped). This is what
+        # makes NGRAM run on NSA paged pools that lack move_kv_cache.
+        self.drafts_are_linear_chains = server_args.speculative_ngram_linear
 
         self.ngram_corpus = NgramCorpus(
             min_bfs_breadth=server_args.speculative_ngram_min_bfs_breadth,
@@ -84,6 +98,7 @@ class NGRAMWorker(BaseSpecWorker):
             draft_token_num=server_args.speculative_num_draft_tokens,
             external_sam_budget=server_args.speculative_ngram_external_sam_budget,
             external_corpus_max_tokens=server_args.speculative_ngram_external_corpus_max_tokens,
+            linear=server_args.speculative_ngram_linear,
         )
         if server_args.speculative_ngram_external_corpus_path is not None:
             from sglang.srt.speculative.cpp_ngram.external_corpus import (
@@ -206,6 +221,40 @@ class NGRAMWorker(BaseSpecWorker):
         if self.adaptive_controller is not None:
             self.adaptive_controller.on_verify_complete(num_correct_drafts_per_req)
 
+    def _pp_non_last_rank_result(
+        self, batch: ScheduleBatch, batch_result: GenerationBatchResult
+    ) -> GenerationBatchResult:
+        """Result for a non-last PP rank: hidden states ride the PP ring; the
+        last rank's accept is relayed back and applied by the scheduler at
+        delivery. The dummy next_draft_input only provides the staging tensors
+        ``_prepare_draft_tokens`` reads unconditionally — their contents are
+        never spliced because PP forces non-overlap scheduling."""
+        bs = len(batch.reqs)
+        if batch.forward_mode.is_target_verify():
+            # Keep corpus match-state GC aligned with the last rank (same
+            # unconditional erase as the verify path in forward_batch_generation).
+            cur_rids = {req.rid for req in batch.reqs}
+            departed_rids = self._prev_decode_rids - cur_rids
+            if departed_rids:
+                self.ngram_corpus.erase_match_state(list(departed_rids))
+            self._prev_decode_rids = cur_rids
+            batch.forward_mode = ForwardMode.DECODE
+        next_draft_input = NgramVerifyInput(
+            draft_token_num=self.draft_token_num,
+            new_seq_lens=batch.seq_lens.clone(),
+            accept_tokens=torch.zeros(
+                bs * self.draft_token_num, dtype=torch.int32, device=self.device
+            ),
+            accept_lens=torch.ones(bs, dtype=torch.int32, device=self.device),
+        )
+        return GenerationBatchResult(
+            logits_output=None,
+            pp_hidden_states_proxy_tensors=batch_result.pp_hidden_states_proxy_tensors,
+            can_run_cuda_graph=batch_result.can_run_cuda_graph,
+            next_draft_input=next_draft_input,
+            speculative_num_draft_tokens=self.speculative_num_draft_tokens,
+        )
+
     def _prepare_draft_tokens(
         self, batch: ScheduleBatch
     ) -> tuple[np.ndarray, np.ndarray]:
@@ -298,7 +347,7 @@ class NGRAMWorker(BaseSpecWorker):
 
         # NOTE: QLEN_MASK is faster than FULL_MASK, but requires corresponding changes in flashinfer.
         # Testing shows about 8% performance improvement (the effect is roughly proportional to batch size).
-        if USE_FULL_MASK:
+        if self.use_full_mask:
             tree_mask = []
             mask = mask.reshape(bs, self.draft_token_num, self.draft_token_num)
             # TODO(siyuan): the for loop here leads to significant overhead in large batch size. Can be written into a kernel.
@@ -370,7 +419,7 @@ class NGRAMWorker(BaseSpecWorker):
         self.ngram_corpus.batch_put(batch_tokens)
 
     def forward_batch_generation(
-        self, batch: ScheduleBatch, on_publish=None
+        self, batch: ScheduleBatch, on_publish=None, pp_proxy_tensors=None
     ) -> GenerationBatchResult:
         fwd_stream = torch.get_device_module(self.device).current_stream()
         record_stream_for_v2_verify(batch, None, fwd_stream)
@@ -393,8 +442,17 @@ class NGRAMWorker(BaseSpecWorker):
                 ).cpu()
 
             batch_result = self.target_worker.forward_batch_generation(
-                batch, is_verify=True
+                batch, is_verify=True, pp_proxy_tensors=pp_proxy_tensors
             )
+
+            if not self.pp_group.is_last_rank:
+                # Non-last PP rank: no logits, so accept is computed on the
+                # last rank and relayed back on the PP output ring; the
+                # scheduler applies it (output_ids / seq_lens / kv counters)
+                # at delivery (see scheduler_pp_mixin). The draft and its KV
+                # slots are identical on every rank (CPU-built), so no
+                # cross-rank KV bookkeeping is needed here.
+                return self._pp_non_last_rank_result(batch, batch_result)
 
             logits_output, can_run_cuda_graph = (
                 batch_result.logits_output,
@@ -448,12 +506,17 @@ class NGRAMWorker(BaseSpecWorker):
             # The KV mover expects drafts-only counts. NGRAM's
             # accept_lens includes the bonus token, matching scheduler output.
             num_correct_drafts_per_req = accept_lens - 1
-            move_accept_tokens_to_target_kvcache(
-                batch,
-                accept_index,
-                num_correct_drafts_per_req,
-                self.token_to_kv_pool_allocator,
-            )
+            if not self.drafts_are_linear_chains:
+                # Linear-chain accepts already occupy the canonical contiguous
+                # target slots, so the move is an identity -- and the KV pool may
+                # not implement it at all (NSA paged pools). Tree drafts accept
+                # non-contiguous slots and must keep the move.
+                move_accept_tokens_to_target_kvcache(
+                    batch,
+                    accept_index,
+                    num_correct_drafts_per_req,
+                    self.token_to_kv_pool_allocator,
+                )
             if batch.return_logprob:
                 # The last arg is the accept_index row width minus 1. NGRAM's
                 # accept_index is (bs, draft_token_num) -- the tree depth is not
@@ -482,7 +545,13 @@ class NGRAMWorker(BaseSpecWorker):
             batch.forward_mode = ForwardMode.DECODE
 
         else:
-            batch_result = self.target_worker.forward_batch_generation(batch)
+            batch_result = self.target_worker.forward_batch_generation(
+                batch, pp_proxy_tensors=pp_proxy_tensors
+            )
+            if not self.pp_group.is_last_rank:
+                # Non-last PP rank extend/idle: hidden states ride the PP
+                # ring; the sampled token is relayed back by the scheduler.
+                return self._pp_non_last_rank_result(batch, batch_result)
             logits_output, predict, can_run_cuda_graph = (
                 batch_result.logits_output,
                 batch_result.next_token_ids,

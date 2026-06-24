@@ -22,6 +22,11 @@ struct Param {
   size_t external_sam_budget = 0;
   size_t external_corpus_max_tokens = 10000000;
   std::string match_type;
+  // Linear-chain mode: emit a single greedy chain (the deepest matched anchor,
+  // breadth 1) instead of a BFS tree. Lets the accepted prefix occupy the
+  // canonical contiguous verify slots so the post-verify KV move is an
+  // identity -- required for NSA paged pools that lack move_kv_cache.
+  bool linear = false;
 
   std::vector<size_t> batch_draft_token_num;
 
