@@ -850,6 +850,52 @@ class TestNgramCorpusExternalSam(CustomTestCase):
         self.assertEqual(ids.tolist(), [3, 20])
 
 
+class TestNgramLinearMode(CustomTestCase):
+    """linear=True must emit a single chain (the contiguous-accept invariant that
+    lets the worker skip move_kv_cache on NSA pools)."""
+
+    def _real_chains(self, corpus, draft_token_num, context):
+        # Number of distinct real draft chains. A short chain is padded with
+        # token 0 up to draft_token_num; those padding leaves ([root, 0]) are
+        # dropped so we count only genuine branches.
+        ids, masks = _batch_get(corpus, [context])
+        paths = corpus.leaf_paths_from_mask(
+            ids.tolist(), masks.reshape(draft_token_num, draft_token_num).tolist()
+        )
+        return [p for p in paths if 0 not in p]
+
+    def _branching_corpus(self, match_type, linear):
+        # Context [1,2,3] has two recorded continuations -> a tree-mode draft
+        # branches; multiple suffix-depth anchors also seed multiple root children
+        # even at breadth 1, so only single-anchor linear mode collapses to a chain.
+        corpus = _make_corpus(
+            match_type, draft_token_num=8, max_bfs_breadth=8, linear=linear
+        )
+        corpus.batch_put([[1, 2, 3, 10, 11], [1, 2, 3, 20, 21]])
+        corpus.synchronize()
+        return corpus
+
+    def test_default_mode_branches_bfs(self):
+        # Sanity: the corpus *can* produce more than one chain in tree mode, so
+        # the linear assertions below are meaningful.
+        corpus = self._branching_corpus("BFS", linear=False)
+        self.assertGreater(len(self._real_chains(corpus, 8, [1, 2, 3])), 1)
+
+    def test_linear_single_chain_bfs(self):
+        corpus = self._branching_corpus("BFS", linear=True)
+        self.assertEqual(len(self._real_chains(corpus, 8, [1, 2, 3])), 1)
+
+    def test_linear_single_chain_prob(self):
+        corpus = self._branching_corpus("PROB", linear=True)
+        self.assertEqual(len(self._real_chains(corpus, 8, [1, 2, 3])), 1)
+
+    def test_linear_rejects_external_sam_budget(self):
+        # The C++ Ngram ctor is the source of truth: linear + a SAM subtree would
+        # be merged at the root (a tree), so construction must fail.
+        with self.assertRaises(Exception):
+            _make_corpus("BFS", linear=True, external_sam_budget=2)
+
+
 class TestNgramCorpusMatchBenchmark(CustomTestCase):
     """Benchmark incremental advance vs full rebuild in match()."""
 

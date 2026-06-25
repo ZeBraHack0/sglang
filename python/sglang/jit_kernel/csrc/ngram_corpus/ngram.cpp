@@ -26,6 +26,19 @@ Ngram::Ngram(size_t capacity, const Param& param) : param_(param) {
     throw std::runtime_error(
         "draft_token_num must be greater than 0, current value: " + std::to_string(param_.draft_token_num));
   }
+  // Linear mode guarantees a single draft chain so the worker can skip the
+  // post-verify move_kv_cache. An external SAM subtree would be merged at the
+  // root (combineRootResults_), re-introducing multiple root children (a tree)
+  // and breaking the contiguous-accept invariant. The combination is
+  // contradictory, so reject it here -- the C++ corpus is the source of truth,
+  // not just the Python ServerArgs check.
+  if (param_.linear && param_.external_sam_budget > 0) {
+    throw std::runtime_error(
+        "linear mode is incompatible with external_sam_budget > 0 "
+        "(a single draft chain cannot also host an external SAM subtree); "
+        "current external_sam_budget: " +
+        std::to_string(param_.external_sam_budget));
+  }
   for (auto config : param_.batch_draft_token_num) {
     if (config != std::numeric_limits<decltype(config)>::max()) {
       if (!(config <= param_.draft_token_num)) {

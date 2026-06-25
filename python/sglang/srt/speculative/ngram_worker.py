@@ -5,6 +5,7 @@ import numpy as np
 import torch
 from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.utils.logprob import compute_spec_v2_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -29,9 +30,6 @@ from sglang.srt.speculative.triton_ops.cache_locs import (
 from sglang.srt.utils.async_probe import maybe_detect_inf, maybe_detect_nan
 
 logger = logging.getLogger(__name__)
-
-
-USE_FULL_MASK = True
 
 
 class NGRAMWorker(BaseSpecWorker):
@@ -75,6 +73,17 @@ class NGRAMWorker(BaseSpecWorker):
         # requests that left the batch (see forward_batch_generation).
         self._prev_decode_rids: set = set()
 
+        # QLEN_MASK is faster than FULL_MASK but needs the attention backend to
+        # read spec_info.custom_mask (e.g. DeepSeek-V4 / GLM-5.2 NSA). Default on
+        # to preserve the prior behaviour; NSA launches set the env to 0.
+        self.use_full_mask = envs.SGLANG_NGRAM_USE_FULL_MASK.get()
+
+        # Linear-chain mode: the C++ corpus emits a single chain, so the accepted
+        # prefix occupies the canonical contiguous verify slots and the
+        # post-verify move_kv_cache becomes an identity (skipped). This is what
+        # makes NGRAM run on NSA paged pools that lack move_kv_cache.
+        self.drafts_are_linear_chains = server_args.speculative_ngram_linear
+
         self.ngram_corpus = NgramCorpus(
             min_bfs_breadth=server_args.speculative_ngram_min_bfs_breadth,
             max_bfs_breadth=server_args.speculative_ngram_max_bfs_breadth,
@@ -84,6 +93,7 @@ class NGRAMWorker(BaseSpecWorker):
             draft_token_num=server_args.speculative_num_draft_tokens,
             external_sam_budget=server_args.speculative_ngram_external_sam_budget,
             external_corpus_max_tokens=server_args.speculative_ngram_external_corpus_max_tokens,
+            linear=server_args.speculative_ngram_linear,
         )
         if server_args.speculative_ngram_external_corpus_path is not None:
             from sglang.srt.speculative.cpp_ngram.external_corpus import (
@@ -298,7 +308,7 @@ class NGRAMWorker(BaseSpecWorker):
 
         # NOTE: QLEN_MASK is faster than FULL_MASK, but requires corresponding changes in flashinfer.
         # Testing shows about 8% performance improvement (the effect is roughly proportional to batch size).
-        if USE_FULL_MASK:
+        if self.use_full_mask:
             tree_mask = []
             mask = mask.reshape(bs, self.draft_token_num, self.draft_token_num)
             # TODO(siyuan): the for loop here leads to significant overhead in large batch size. Can be written into a kernel.
@@ -448,12 +458,17 @@ class NGRAMWorker(BaseSpecWorker):
             # The KV mover expects drafts-only counts. NGRAM's
             # accept_lens includes the bonus token, matching scheduler output.
             num_correct_drafts_per_req = accept_lens - 1
-            move_accept_tokens_to_target_kvcache(
-                batch,
-                accept_index,
-                num_correct_drafts_per_req,
-                self.token_to_kv_pool_allocator,
-            )
+            if not self.drafts_are_linear_chains:
+                # Linear-chain accepts already occupy the canonical contiguous
+                # target slots, so the move is an identity -- and the KV pool may
+                # not implement it at all (NSA paged pools). Tree drafts accept
+                # non-contiguous slots and must keep the move.
+                move_accept_tokens_to_target_kvcache(
+                    batch,
+                    accept_index,
+                    num_correct_drafts_per_req,
+                    self.token_to_kv_pool_allocator,
+                )
             if batch.return_logprob:
                 # The last arg is the accept_index row width minus 1. NGRAM's
                 # accept_index is (bs, draft_token_num) -- the tree depth is not

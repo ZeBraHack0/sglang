@@ -1656,6 +1656,17 @@ class ServerArgs:
         int,
         "Fail startup if the tokenized external ngram corpus exceeds this many tokens. Tune this based on your CPU memory budget.",
     ] = 10000000
+    speculative_ngram_linear: A[
+        bool,
+        (
+            "Emit a single linear draft chain instead of a BFS tree (forces "
+            "breadth 1 and no external SAM subtree). The accepted prefix then "
+            "occupies the canonical contiguous verify slots, so the post-verify "
+            "KV move is skipped -- required for NSA paged KV pools (e.g. "
+            "DeepSeek-V4 / GLM-5.2) that do not implement move_kv_cache, and a "
+            "prerequisite for ngram PD / PP / dp-attention support."
+        ),
+    ] = False
 
     # -------------------------------------------------------------------------
     # Expert parallelism
@@ -6805,6 +6816,44 @@ class ServerArgs:
             assert (
                 not self.enable_mixed_chunk
             ), "enable_mixed_chunk is required for speculative decoding"
+
+        # Linear-mode NGRAM: emit one chain so the accepted prefix is contiguous.
+        if self.speculative_ngram_linear:
+            assert self.speculative_algorithm == "NGRAM", (
+                "--speculative-ngram-linear only applies to "
+                "--speculative-algorithm NGRAM."
+            )
+            # An external SAM subtree merges at the root and would add a second
+            # chain (a tree), breaking the contiguous-accept invariant. The C++
+            # Ngram constructor also rejects this combination (source of truth);
+            # this is the friendly CLI-level error.
+            assert self.speculative_ngram_external_sam_budget == 0, (
+                "--speculative-ngram-linear requires "
+                "--speculative-ngram-external-sam-budget 0 (a single chain "
+                "cannot also host an external SAM subtree)."
+            )
+            # An external corpus is loaded into a SAM, which linear mode never
+            # queries -- forbid it rather than silently load inert data.
+            assert self.speculative_ngram_external_corpus_path is None, (
+                "--speculative-ngram-linear does not support an external corpus "
+                "(--speculative-ngram-external-corpus-path); the SAM it builds is "
+                "never queried in linear (trie-only) mode."
+            )
+            # Force breadth 1. The C++ builders force a single chain regardless
+            # (single deepest anchor + breadth 1); this only keeps the reported
+            # config consistent. Log if it overrides an explicit user value.
+            if (
+                self.speculative_ngram_min_bfs_breadth != 1
+                or self.speculative_ngram_max_bfs_breadth != 1
+            ):
+                logger.info(
+                    "Overriding speculative_ngram_{min,max}_bfs_breadth to 1 for "
+                    "--speculative-ngram-linear (was %d/%d).",
+                    self.speculative_ngram_min_bfs_breadth,
+                    self.speculative_ngram_max_bfs_breadth,
+                )
+            self.speculative_ngram_min_bfs_breadth = 1
+            self.speculative_ngram_max_bfs_breadth = 1
 
         # Check chunked prefill
         # Skip validation if chunked prefill is disabled (i.e., size <= 0).

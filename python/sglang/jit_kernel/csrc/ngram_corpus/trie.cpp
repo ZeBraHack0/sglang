@@ -233,7 +233,11 @@ Result Trie::buildRecency(
 
   for (auto [node, depth] : anchors) {
     std::queue<std::tuple<int32_t, double, const TrieNode*>> queue;
-    queue.push({root, (max_match_depth - depth) * bfs_breadth_scale + param.min_bfs_breadth, node});
+    // Linear mode: a single chain off the deepest anchor (anchors are ordered
+    // deepest-first), breadth forced to 1. Otherwise the usual BFS tree.
+    const double init_breadth =
+        param.linear ? 1.0 : (max_match_depth - depth) * bfs_breadth_scale + param.min_bfs_breadth;
+    queue.push({root, init_breadth, node});
     while (queue.size() && cursor <= static_cast<int>(draft_token_num)) {
       auto front = queue.front();
       queue.pop();
@@ -242,7 +246,7 @@ Result Trie::buildRecency(
       auto cur_breadth = std::get<1>(front);
       auto iter = std::get<2>(front)->lru.begin();
 
-      auto breadth = std::max(1, int32_t(cur_breadth));
+      auto breadth = param.linear ? 1 : std::max(1, int32_t(cur_breadth));
       for (int i = 0;
            i < breadth && iter != std::get<2>(front)->lru.end() && cursor <= static_cast<int>(draft_token_num);
            ++i, ++iter) {
@@ -253,9 +257,12 @@ Result Trie::buildRecency(
         } else {
           pos = tree[parent].next.insert(std::make_pair(token, cursor++)).first->second;
         }
-        queue.emplace(pos, cur_breadth - bfs_breadth_scale, *iter);
+        queue.emplace(pos, param.linear ? 1.0 : cur_breadth - bfs_breadth_scale, *iter);
       }
     }
+    // Linear mode emits exactly one chain: stop after the deepest anchor so the
+    // root never gains a second child (which would make the draft a tree).
+    if (param.linear) break;
   }
 
   return fillResult(last_token, draft_token_num + 1, tree, root);
@@ -288,7 +295,8 @@ Result Trie::buildFrequency(
 
   int root = 0;
   int cursor = 1;
-  int top_k = param.max_bfs_breadth;
+  // Linear mode: keep only the single highest-probability child at each node.
+  int top_k = param.linear ? 1 : param.max_bfs_breadth;
 
   auto addToHeap = [&heap, &top_k](int parent, const TrieNode* trie_node, double prob) -> void {
     double sum_freq = 0.0;
@@ -323,6 +331,9 @@ Result Trie::buildFrequency(
       }
       addToHeap(pos, trie_node, prob);
     }
+    // Linear mode emits exactly one chain: stop after the deepest anchor so the
+    // root never gains a second child (which would make the draft a tree).
+    if (param.linear) break;
   }
 
   return fillResult(last_token, draft_token_num + 1, tree, root);

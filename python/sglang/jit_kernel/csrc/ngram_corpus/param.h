@@ -22,6 +22,14 @@ struct Param {
   size_t external_sam_budget = 0;
   size_t external_corpus_max_tokens = 10000000;
   std::string match_type;
+  // Linear-chain mode: the trie builder emits a single greedy chain (the
+  // deepest matched anchor, breadth 1) instead of a BFS tree, so the accepted
+  // prefix occupies the canonical contiguous verify slots and the post-verify
+  // KV move is an identity -- required for NSA paged pools that lack
+  // move_kv_cache. The single-chain guarantee requires the trie-only path; the
+  // Ngram ctor therefore rejects linear together with external_sam_budget > 0
+  // (a merged SAM subtree would re-introduce multiple root children).
+  bool linear = false;
 
   std::vector<size_t> batch_draft_token_num;
 
