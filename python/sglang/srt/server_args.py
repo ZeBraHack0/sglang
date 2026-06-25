@@ -6784,8 +6784,18 @@ class ServerArgs:
 
         if self.pp_size > 1:
             assert (
-                self.disable_overlap_schedule and self.speculative_algorithm is None
-            ), "Pipeline parallelism is not compatible with overlap schedule, speculative decoding"
+                self.disable_overlap_schedule
+            ), "Pipeline parallelism is not compatible with overlap schedule"
+            # Linear-mode NGRAM is the one speculative path that supports PP: its
+            # draft is a fixed-width single chain, so the per-token PP proxy
+            # buffers and the spec-accept-length relay are well-defined.
+            assert self.speculative_algorithm is None or (
+                self.speculative_algorithm == "NGRAM" and self.speculative_ngram_linear
+            ), (
+                "Pipeline parallelism with speculative decoding is only supported "
+                "for linear-mode NGRAM (--speculative-algorithm NGRAM "
+                "--speculative-ngram-linear)."
+            )
 
         assert not (
             self.dp_size > 1 and self.nnodes != 1 and not self.enable_dp_attention

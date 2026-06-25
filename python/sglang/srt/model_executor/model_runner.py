@@ -767,6 +767,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         assert (
             (not model_has_mtp_layers)
             or (self.spec_algorithm.is_none())
+            # NGRAM drafts from a CPU n-gram corpus, not the MTP layers, so
+            # PP-splitting an MTP-bearing model is fine for it (the MTP layers
+            # are simply unused).
+            or (self.spec_algorithm.is_ngram())
             or (
                 (not self.spec_algorithm.is_none())
                 and (self.num_effective_layers == model_num_layers)
